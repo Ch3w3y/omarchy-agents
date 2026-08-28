@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+# omarchy:summary=Print the Antigravity CLI usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Antigravity CLI usage into one display-ready JSON record.
+
+Parses native Antigravity conversation databases (~/.gemini/antigravity-cli/conversations/*.db),
+transcripts (~/.gemini/antigravity-cli/brain/*), history.jsonl, and any opencode / pi
+sessions running on Google/Gemini models.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "antigravity"
+AGENT_NAME = "Antigravity"
+AUTH_HELP = "Run `agy` to authenticate with your Google account."
+
+
+def state_dir() -> Path:
+  root = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+  return root / "omarchy" / "agents"
+
+
+def usage_dir() -> Path:
+  d = state_dir() / "usage"
+  d.mkdir(parents=True, exist_ok=True)
+  return d
+
+
+def local_date_str(val: Any = None) -> str:
+  if val is None:
+    return dt.datetime.now().strftime("%Y-%m-%d")
+  if isinstance(val, (int, float)):
+    ts = float(val) / 1000.0 if float(val) > 1e11 else float(val)
+    try:
+      return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    except Exception:
+      return dt.datetime.now().strftime("%Y-%m-%d")
+  raw = str(val).strip()
+  if not raw:
+    return dt.datetime.now().strftime("%Y-%m-%d")
+  try:
+    parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+      parsed = parsed.astimezone()
+    return parsed.strftime("%Y-%m-%d")
+  except Exception:
+    return raw[:10] if len(raw) >= 10 else dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def recent_date_strings() -> list[str]:
+  today = dt.datetime.now().date()
+  return [(today - dt.timedelta(days=o)).strftime("%Y-%m-%d") for o in range(6, -1, -1)]
+
+
+def decode_varint(data: bytes, offset: int) -> tuple[int, int]:
+  res = 0
+  shift = 0
+  while offset < len(data):
+    b = data[offset]
+    offset += 1
+    res |= (b & 0x7F) << shift
+    shift += 7
+    if not (b & 0x80):
+      break
+  return res, offset
+
+
+def parse_protobuf(data: bytes) -> dict[int, list[tuple[str, Any]]]:
+  fields: dict[int, list[tuple[str, Any]]] = {}
+  offset = 0
+  data_len = len(data)
+  while offset < data_len:
+    try:
+      key, offset = decode_varint(data, offset)
+    except Exception:
+      break
+    wire = key & 7
+    field = key >> 3
+    if wire == 0:  # varint
+      try:
+        val, offset = decode_varint(data, offset)
+        fields.setdefault(field, []).append(("varint", val))
+      except Exception:
+        break
+    elif wire == 2:  # length-delimited
+      try:
+        length, offset = decode_varint(data, offset)
+        if offset + length > data_len:
+          break
+        val_bytes = data[offset : offset + length]
+        offset += length
+        fields.setdefault(field, []).append(("bytes", val_bytes))
+      except Exception:
+        break
+    elif wire == 1:  # 64-bit
+      if offset + 8 > data_len:
+        break
+      val_bytes = data[offset : offset + 8]
+      offset += 8
+      fields.setdefault(field, []).append(("64bit", val_bytes))
+    elif wire == 5:  # 32-bit
+      if offset + 4 > data_len:
+        break
+      val_bytes = data[offset : offset + 4]
+      offset += 4
+      fields.setdefault(field, []).append(("32bit", val_bytes))
+    else:
+      break
+  return fields
+
+
+def empty_bucket() -> dict[str, int]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def scan_antigravity_native() -> dict[str, Any]:
+  base_dir = Path.home() / ".gemini" / "antigravity-cli"
+  conversations_dir = base_dir / "conversations"
+  brain_dir = base_dir / "brain"
+
+  today = local_date_str()
+  recent_dates = recent_date_strings()
+  recent = {d: {"date": d, "messageCount": 0} for d in recent_dates}
+
+  active_dates: set[str] = set()
+  sessions: set[str] = set()
+  today_sessions: set[str] = set()
+  model_usage: dict[str, dict[str, int]] = {}
+  today_tokens_by_model: dict[str, int] = {}
+
+  total_prompts = 0
+  today_prompts = 0
+  today_total_tokens = 0
+
+  if not conversations_dir.is_dir():
+    return {
+      "todayPrompts": 0,
+      "todaySessions": 0,
+      "todayTotalTokens": 0,
+      "todayTokensByModel": {},
+      "recentDays": [recent[d] for d in recent_dates],
+      "totalPrompts": 0,
+      "totalSessions": 0,
+      "activeDays": 0,
+      "activeDates": [],
+      "modelUsage": {},
+    }
+
+  for db_path in conversations_dir.glob("*.db"):
+    conv_id = db_path.stem
+    session_key = f"antigravity:{conv_id}"
+    sessions.add(session_key)
+
+    mtime = db_path.stat().st_mtime
+    conv_default_day = local_date_str(mtime)
+
+    # Read transcript.jsonl if present for timestamps & prompt count
+    step_dates: dict[int, str] = {}
+    conv_prompts = 0
+    transcript_path = brain_dir / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+    if transcript_path.is_file():
+      try:
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as fh:
+          for line in fh:
+            line = line.strip()
+            if not line:
+              continue
+            try:
+              row = json.loads(line)
+            except Exception:
+              continue
+            s_idx = row.get("step_index")
+            created_at = row.get("created_at")
+            if s_idx is not None and created_at:
+              step_dates[s_idx] = local_date_str(created_at)
+            if row.get("type") == "USER_INPUT":
+              conv_prompts += 1
+              p_day = local_date_str(created_at) if created_at else conv_default_day
+              active_dates.add(p_day)
+              if p_day == today:
+                today_prompts += 1
+                today_sessions.add(session_key)
+      except Exception:
+        pass
+
+    total_prompts += max(1, conv_prompts)
+
+    # Parse gen_metadata in SQLite DB
+    try:
+      conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True, timeout=2)
+      conn.execute("PRAGMA query_only = ON")
+      cur = conn.cursor()
+      cur.execute("SELECT idx, data FROM gen_metadata ORDER BY idx")
+      rows = cur.fetchall()
+      conn.close()
+    except Exception:
+      rows = []
+
+    for idx, data_blob in rows:
+      if not data_blob or not isinstance(data_blob, bytes):
+        continue
+      top = parse_protobuf(data_blob)
+      if 1 not in top:
+        continue
+      for typ, sub_bytes in top[1]:
+        if typ != "bytes":
+          continue
+        f1 = parse_protobuf(sub_bytes)
+        model = "gemini-3.7-flash"
+        if 19 in f1:
+          for _, mb in f1[19]:
+            if isinstance(mb, bytes):
+              model = mb.decode("latin1", "ignore").strip()
+        if not model:
+          model = "gemini-3.7-flash"
+
+        input_tokens = 0
+        output_tokens = 0
+        cache_read = 0
+        cache_write = 0
+
+        if 4 in f1:
+          for _, tb in f1[4]:
+            if isinstance(tb, bytes):
+              f4 = parse_protobuf(tb)
+              if 2 in f4 and f4[2]:
+                input_tokens = f4[2][0][1]
+              if 3 in f4 and f4[3]:
+                output_tokens = f4[3][0][1]
+              if 5 in f4 and f4[5]:
+                cache_read = f4[5][0][1]
+              if 6 in f4 and f4[6]:
+                cache_write = f4[6][0][1]
+
+        total = input_tokens + output_tokens + cache_read + cache_write
+        if total <= 0:
+          continue
+
+        step_day = step_dates.get(idx, conv_default_day)
+        active_dates.add(step_day)
+
+        bucket = model_usage.setdefault(model, empty_bucket())
+        bucket["inputTokens"] += input_tokens
+        bucket["outputTokens"] += output_tokens
+        bucket["cacheReadInputTokens"] += cache_read
+        bucket["cacheCreationInputTokens"] += cache_write
+
+        if step_day in recent:
+          recent[step_day]["messageCount"] += total
+        if step_day == today:
+          today_sessions.add(session_key)
+          today_total_tokens += total
+          today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+
+  if today_prompts == 0 and len(today_sessions) > 0:
+    today_prompts = len(today_sessions)
+
+  return {
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_total_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [recent[d] for d in recent_dates],
+    "totalPrompts": total_prompts,
+    "totalSessions": len(sessions),
+    "activeDays": len(active_dates),
+    "activeDates": sorted(active_dates),
+    "modelUsage": model_usage,
+  }
+
+
+def scan_opencode_google_usage() -> dict[str, Any] | None:
+  db = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "opencode" / "opencode.db"
+  if not db.is_file():
+    return None
+
+  today = local_date_str()
+  recent_dates = recent_date_strings()
+  recent = {d: {"date": d, "messageCount": 0} for d in recent_dates}
+  sessions: set[str] = set()
+  active_dates: set[str] = set()
+  today_sessions: set[str] = set()
+  model_usage: dict[str, dict[str, int]] = {}
+  today_tokens_by_model: dict[str, int] = {}
+  prompts = 0
+  today_prompts = 0
+  today_total_tokens = 0
+
+  try:
+    conn = sqlite3.connect(f"file:{db.resolve()}?mode=ro", uri=True, timeout=2)
+    conn.execute("PRAGMA query_only = ON")
+    for session_id, raw in conn.execute("SELECT session_id, data FROM message WHERE data LIKE '%assistant%'"):
+      try:
+        entry = json.loads(raw)
+        if not isinstance(entry, dict) or entry.get("role") != "assistant":
+          continue
+        provider_id = str(entry.get("providerID") or "").lower()
+        if provider_id not in ("google", "gemini", "antigravity"):
+          continue
+        tokens = entry.get("tokens") or {}
+        cache = tokens.get("cache") or {}
+        input_tokens = int(tokens.get("input") or 0)
+        output_tokens = int(tokens.get("output") or 0) + int(tokens.get("reasoning") or 0)
+        cache_read = int(cache.get("read") or 0)
+        cache_write = int(cache.get("write") or 0)
+        total = input_tokens + output_tokens + cache_read + cache_write
+        if total <= 0:
+          continue
+
+        created = int((entry.get("time") or {}).get("created") or 0)
+        day = local_date_str(created / 1000) if created > 0 else today
+        model = str(entry.get("modelID") or "gemini").rstrip("/").split("/")[-1]
+      except Exception:
+        continue
+
+      session_key = f"opencode:{session_id}"
+      sessions.add(session_key)
+      active_dates.add(day)
+      prompts += 1
+
+      bucket = model_usage.setdefault(model, empty_bucket())
+      bucket["inputTokens"] += input_tokens
+      bucket["outputTokens"] += output_tokens
+      bucket["cacheReadInputTokens"] += cache_read
+      bucket["cacheCreationInputTokens"] += cache_write
+
+      if day in recent:
+        recent[day]["messageCount"] += total
+      if day == today:
+        today_prompts += 1
+        today_sessions.add(session_key)
+        today_total_tokens += total
+        today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+    conn.close()
+  except Exception:
+    return None
+
+  if prompts == 0:
+    return None
+
+  return {
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_total_tokens,
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [recent[d] for d in recent_dates],
+    "totalPrompts": prompts,
+    "totalSessions": len(sessions),
+    "activeDays": len(active_dates),
+    "activeDates": sorted(active_dates),
+    "modelUsage": model_usage,
+  }
+
+
+def merge_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+  today_tokens: dict[str, int] = dict(a.get("todayTokensByModel") or {})
+  for m, v in (b.get("todayTokensByModel") or {}).items():
+    today_tokens[m] = today_tokens.get(m, 0) + int(v or 0)
+
+  model_usage: dict[str, dict[str, int]] = {}
+  for src in (a.get("modelUsage") or {}, b.get("modelUsage") or {}):
+    for m, bucket in src.items():
+      tgt = model_usage.setdefault(m, empty_bucket())
+      for k in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"):
+        tgt[k] += int(bucket.get(k) or 0)
+
+  recent_map: dict[str, int] = {}
+  for day_row in a.get("recentDays") or []:
+    recent_map[day_row["date"]] = int(day_row.get("messageCount") or 0)
+  for day_row in b.get("recentDays") or []:
+    recent_map[day_row["date"]] = recent_map.get(day_row["date"], 0) + int(day_row.get("messageCount") or 0)
+
+  recent_dates = recent_date_strings()
+  merged_recent = [{"date": d, "messageCount": recent_map.get(d, 0)} for d in recent_dates]
+
+  active_dates = sorted(set(a.get("activeDates") or []).union(set(b.get("activeDates") or [])))
+
+  return {
+    "todayPrompts": int(a.get("todayPrompts") or 0) + int(b.get("todayPrompts") or 0),
+    "todaySessions": int(a.get("todaySessions") or 0) + int(b.get("todaySessions") or 0),
+    "todayTotalTokens": int(a.get("todayTotalTokens") or 0) + int(b.get("todayTotalTokens") or 0),
+    "todayTokensByModel": today_tokens,
+    "recentDays": merged_recent,
+    "totalPrompts": int(a.get("totalPrompts") or 0) + int(b.get("totalPrompts") or 0),
+    "totalSessions": int(a.get("totalSessions") or 0) + int(b.get("totalSessions") or 0),
+    "activeDays": len(active_dates),
+    "activeDates": active_dates,
+    "modelUsage": model_usage,
+  }
+
+
+def get_auth_info() -> tuple[str, str, str]:
+  gemini_dir = Path.home() / ".gemini"
+  accounts_file = gemini_dir / "google_accounts.json"
+  oauth_file = gemini_dir / "oauth_creds.json"
+  email = ""
+
+  if accounts_file.is_file():
+    try:
+      data = json.loads(accounts_file.read_text(encoding="utf-8"))
+      email = str(data.get("active") or "").strip()
+    except Exception:
+      pass
+
+  is_authenticated = bool(email)
+  is_expired = False
+
+  if oauth_file.is_file():
+    try:
+      data = json.loads(oauth_file.read_text(encoding="utf-8"))
+      expiry = data.get("expiry_date")
+      if expiry and float(expiry) < (time.time() * 1000) and not data.get("refresh_token"):
+        is_expired = True
+    except Exception:
+      pass
+
+  if not is_authenticated:
+    return "Waiting for auth", AUTH_HELP, "Subscription"
+  if is_expired:
+    return "Sign-in expired", "Google credentials expired. Launch `agy` to refresh authentication.", f"Google AI ({email})" if email else "Google AI"
+
+  plan_label = f"Google AI ({email})" if email else "Google AI"
+  return "", "", plan_label
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Collect Antigravity usage metrics")
+  parser.add_argument("--force", action="store_true", help="Force refresh")
+  parser.add_argument("--limits-only", action="store_true", help="Limits only refresh")
+  parser.add_argument("--write-state", action="store_true", help="Write to ~/.local/state/omarchy/agents/usage/")
+  args = parser.parse_args()
+
+  stats = scan_antigravity_native()
+  opencode_stats = scan_opencode_google_usage()
+  if opencode_stats:
+    stats = merge_stats(stats, opencode_stats)
+
+  usage_status, auth_help, tier_label = get_auth_info()
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "ready": int(stats.get("totalPrompts") or 0) > 0 or int(stats.get("todayTotalTokens") or 0) > 0,
+    "hasLocalStats": True,
+    "hasPromptStats": True,
+    "tierLabel": tier_label,
+    "usageStatusText": usage_status,
+    "authHelpText": auth_help,
+    "limits": [],
+  }
+  record.update(stats)
+
+  record_json = json.dumps(record, separators=(",", ":"), sort_keys=True)
+  print(record_json)
+
+  if args.write_state:
+    u_dir = usage_dir()
+    tmp_path = u_dir / f".{AGENT_ID}.tmp"
+    tmp_path.write_text(record_json + "\n", encoding="utf-8")
+    tmp_path.replace(u_dir / f"{AGENT_ID}.json")
+
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

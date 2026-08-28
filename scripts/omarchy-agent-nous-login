@@ -1,0 +1,143 @@
+#!/usr/bin/python3
+# omarchy:summary=Sign in to Nous Portal for the Agents panel
+# omarchy:args=[]
+"""Interactive OAuth device-code login for Nous Portal.
+
+Nous Portal has no plain API key for the account/usage lookup the `nous`
+collector needs — only OAuth. This runs the standard RFC 8628 device-code
+flow against the same public `hermes-cli` client id Hermes Agent and
+ai-usagebar use, and saves the resulting token to
+~/.config/omarchy/agents/nous-credentials.json, where
+omarchy-agent-usage-nous reads it (and refreshes it on its own from then on).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+CLIENT_ID = "hermes-cli"
+SCOPE = "inference:invoke"
+DEVICE_CODE_URL = "https://portal.nousresearch.com/api/oauth/device/code"
+TOKEN_URL = "https://portal.nousresearch.com/api/oauth/token"
+USER_AGENT = "omarchy-agents/1.0"
+HTTP_TIMEOUT = 10
+
+
+def config_home() -> Path:
+  return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+def token_store_path() -> Path:
+  return config_home() / "omarchy" / "agents" / "nous-credentials.json"
+
+
+def write_json_secret(path: Path, data: dict[str, Any]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  try:
+    os.chmod(path.parent, 0o700)
+  except OSError:
+    pass
+  tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+  fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+  with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+  os.replace(tmp, path)
+
+
+def post_form(url: str, fields: dict[str, str], extra_headers: dict[str, str] | None = None) -> tuple[int, Any]:
+  body = urllib.parse.urlencode(fields).encode("ascii")
+  headers = {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json", "User-Agent": USER_AGENT}
+  headers.update(extra_headers or {})
+  req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+  try:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+      return response.status, json.loads(response.read().decode("utf-8", errors="replace"))
+  except urllib.error.HTTPError as error:
+    try:
+      payload = json.loads(error.read().decode("utf-8", errors="replace"))
+    except Exception:
+      payload = {}
+    return error.code, payload
+
+
+def main() -> int:
+  print("Requesting a Nous Portal device code...")
+  status, payload = post_form(DEVICE_CODE_URL, {"client_id": CLIENT_ID, "scope": SCOPE})
+  if status != 200:
+    print(f"Nous Portal rejected the device-code request (status {status}).", file=sys.stderr)
+    return 1
+
+  device_code = str(payload.get("device_code") or "")
+  user_code = str(payload.get("user_code") or "")
+  verification_uri_complete = str(payload.get("verification_uri_complete") or payload.get("verification_uri") or "")
+  expires_in = float(payload.get("expires_in") or 600)
+  interval = max(1.0, float(payload.get("interval") or 5))
+
+  if not device_code or not user_code or not verification_uri_complete:
+    print("Nous Portal's device-code response didn't match what this expects.", file=sys.stderr)
+    return 1
+
+  print()
+  print(f"  Open: {verification_uri_complete}")
+  print(f"  Confirm code: {user_code}")
+  print()
+  print("Waiting for confirmation...", flush=True)
+  subprocess.run(["xdg-open", verification_uri_complete], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+  deadline = time.monotonic() + expires_in
+  while time.monotonic() < deadline:
+    time.sleep(interval)
+    status, payload = post_form(
+      TOKEN_URL,
+      {
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_id": CLIENT_ID,
+        "device_code": device_code,
+      },
+    )
+    if status == 200:
+      access_token = str(payload.get("access_token") or "")
+      refresh_token = str(payload.get("refresh_token") or "")
+      expires_val = payload.get("expires_in")
+      if not access_token or not refresh_token or not isinstance(expires_val, (int, float)):
+        print("Nous Portal's token response didn't match what this expects.", file=sys.stderr)
+        return 1
+      expires_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=float(expires_val))
+      write_json_secret(token_store_path(), {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": expires_at.isoformat(),
+      })
+      print("Signed in. The Nous Portal tab will pick this up on its next refresh.")
+      return 0
+
+    error = str((payload or {}).get("error") or "")
+    if error == "authorization_pending":
+      continue
+    if error == "slow_down":
+      interval += 5
+      continue
+    if error == "access_denied":
+      print("Sign-in was denied.", file=sys.stderr)
+      return 1
+    if error == "expired_token":
+      break
+    print(f"Nous Portal returned an unexpected response (status {status}, error {error!r}).", file=sys.stderr)
+    return 1
+
+  print("The device code expired before sign-in was confirmed. Run this again.", file=sys.stderr)
+  return 1
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

@@ -1,0 +1,248 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the OpenRouter usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect OpenRouter's prepaid balance and per-key usage into one
+display-ready JSON record.
+
+Calls OpenRouter's `/api/v1/credits` (funded vs. spent) and `/api/v1/key`
+(per-key cap, free-tier flag) endpoints and folds them into the balance +
+limits shape the agents panel expects. OpenRouter keeps no local session or
+transcript data of its own, so this collector reports balance/limits only —
+no token or prompt counts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "openrouter"
+AGENT_NAME = "OpenRouter"
+AUTH_HELP = "Add a key from the panel's gear icon (or set OPENROUTER_API_KEY)."
+CREDITS_ENDPOINT = "https://openrouter.ai/api/v1/credits"
+KEY_ENDPOINT = "https://openrouter.ai/api/v1/key"
+PROBE_MIN_INTERVAL_SECONDS = 20
+HTTP_TIMEOUT = 10
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def number(value: Any) -> float:
+  try:
+    n = float(value)
+    return n if n == n and abs(n) != float("inf") else 0.0
+  except Exception:
+    return 0.0
+
+
+def read_json(path: Path) -> dict[str, Any] | None:
+  try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else None
+  except Exception:
+    return None
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+  tmp = path.with_name(path.name + ".tmp")
+  tmp.write_text(json.dumps(data), encoding="utf-8")
+  tmp.replace(path)
+
+
+def toml_value(path: Path, section: str, key: str) -> str:
+  # ai-usagebar's config is flat `key = "value"` pairs under `[section]`
+  # headers, which is all a shared credential lookup needs — not worth a
+  # TOML dependency just to read one string back out.
+  try:
+    text = path.read_text(encoding="utf-8")
+  except Exception:
+    return ""
+  in_section = False
+  pattern = re.compile(r'^' + re.escape(key) + r'\s*=\s*"(.*)"\s*$')
+  for line in text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("["):
+      in_section = stripped == f"[{section}]"
+      continue
+    if not in_section:
+      continue
+    match = pattern.match(stripped)
+    if match:
+      return match.group(1)
+  return ""
+
+
+def config_home() -> Path:
+  return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+
+
+# The Agents panel's own settings screen (the gear icon) writes keys here via
+# omarchy-agent-credential-set — this is the primary path once someone has
+# used it, checked ahead of the opportunistic ai-usagebar fallback below.
+def agents_credential(provider_id: str) -> str:
+  data = read_json(config_home() / "omarchy" / "agents" / "credentials.json")
+  if not data:
+    return ""
+  entry = data.get(provider_id)
+  if isinstance(entry, dict):
+    return str(entry.get("apiKey") or "").strip()
+  return ""
+
+
+def api_key() -> str:
+  env = os.environ.get("OPENROUTER_API_KEY", "").strip()
+  if env:
+    return env
+  from_settings = agents_credential(AGENT_ID)
+  if from_settings:
+    return from_settings
+  toml_path = config_home() / "ai-usagebar" / "config.toml"
+  return toml_value(toml_path, "openrouter", "api_key").strip()
+
+
+def request(url: str, key: str) -> dict[str, Any]:
+  req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": "omarchy-agents/1.0"})
+  with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+    return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def probe(key: str) -> dict[str, Any]:
+  try:
+    credits = request(CREDITS_ENDPOINT, key).get("data") or {}
+    key_data = request(KEY_ENDPOINT, key).get("data") or {}
+  except urllib.error.HTTPError as error:
+    if error.code in (401, 403):
+      return {"ok": False, "helpText": "OpenRouter rejected the API key. " + AUTH_HELP}
+    if error.code == 429:
+      return {"ok": False, "helpText": "OpenRouter is rate limiting usage checks right now."}
+    return {"ok": False, "helpText": f"OpenRouter's usage endpoint returned status {error.code}."}
+  except Exception:
+    return {"ok": False, "transport": True, "helpText": "Couldn't reach OpenRouter. Retrying shortly."}
+
+  total_credits = number(credits.get("total_credits"))
+  total_usage = number(credits.get("total_usage"))
+  label = str(key_data.get("label") or "").strip()
+  is_free = key_data.get("is_free_tier") is True
+  limit = key_data.get("limit")
+  limit_remaining = key_data.get("limit_remaining")
+
+  balance = None
+  if total_credits > 0:
+    balance = {
+      "remaining": max(0.0, total_credits - total_usage),
+      "funded": total_credits,
+      "spent": total_usage,
+      "currency": "USD",
+      "estimated": False,
+    }
+
+  limits: list[dict[str, Any]] = []
+  if limit is not None:
+    limit_num = number(limit)
+    if limit_num > 0:
+      spent = limit_num - number(limit_remaining) if limit_remaining is not None else total_usage
+      # The panel's `percent` contract is a 0-1 fraction (it multiplies by
+      # 100 to display and alarms at >= 0.9).
+      percent = max(0.0, min(1.0, spent / limit_num))
+      limits.append({"label": "Key cap", "title": "Key cap", "percent": percent, "resetsAt": ""})
+
+  tier = "OpenRouter"
+  if label:
+    tier = f"OpenRouter — {label}"
+  elif is_free:
+    tier = "OpenRouter (free tier)"
+
+  return {"ok": True, "balance": balance, "limits": limits, "tierLabel": tier}
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--force", action="store_true", help="ignore the short reuse window and re-probe")
+  parser.add_argument("--limits-only", action="store_true", help="accepted for contract parity; every probe here is a limits probe")
+  args = parser.parse_args()
+
+  cache_path = cache_root() / f"{AGENT_ID}.json"
+  cached = read_json(cache_path) or {}
+  fetched_at = number(cached.get("fetchedAtMs")) / 1000
+  fallback = cached.get("record") if isinstance(cached.get("record"), dict) else None
+
+  now = dt.datetime.now(dt.timezone.utc).isoformat()
+  key = api_key()
+
+  if key == "":
+    record = dict(fallback or {})
+    record.update({
+      "schemaVersion": 1,
+      "id": AGENT_ID,
+      "name": AGENT_NAME,
+      "updatedAt": now,
+      "ready": bool(fallback and (fallback.get("balance") or fallback.get("limits"))),
+      "hasLocalStats": False,
+      "hasPromptStats": False,
+      "usageStatusText": "Waiting for auth",
+      "authHelpText": AUTH_HELP,
+    })
+    record.setdefault("limits", [])
+    print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+    return 0
+
+  if not args.force and fallback and time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+    print(json.dumps(fallback, separators=(",", ":"), sort_keys=True))
+    return 0
+
+  probed = probe(key)
+
+  if not probed["ok"]:
+    record = dict(fallback) if fallback else {
+      "schemaVersion": 1,
+      "id": AGENT_ID,
+      "name": AGENT_NAME,
+      "hasLocalStats": False,
+      "hasPromptStats": False,
+      "ready": False,
+      "limits": [],
+    }
+    record["updatedAt"] = now
+    record["usageStatusText"] = "" if fallback else "OpenRouter usage unavailable"
+    record["authHelpText"] = probed["helpText"]
+    if probed.get("transport"):
+      record["retryAdvised"] = True
+    print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+    return 0
+
+  record = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": now,
+    "ready": True,
+    "hasLocalStats": False,
+    "hasPromptStats": False,
+    "tierLabel": probed["tierLabel"],
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": probed["limits"],
+  }
+  if probed["balance"] is not None:
+    record["balance"] = probed["balance"]
+
+  write_json(cache_path, {"fetchedAtMs": round(time.time() * 1000), "record": record})
+  print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
