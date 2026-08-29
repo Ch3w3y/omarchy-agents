@@ -92,14 +92,21 @@ def data_home() -> Path:
 
 # opencode itself signs in to OpenCode Go via `opencode auth login`, which
 # lands the key in its own credential store keyed by provider id — the same
-# file Fireworks' collector already reads for an opencode-stored key.
+# file Fireworks' collector already reads for an opencode-stored key. The
+# provider id opencode actually writes there for this login is "opencode"
+# (verified against a live `opencode auth login` run), not "opencode-go" --
+# check that first since it's what really shows up, falling back to
+# "opencode-go" in case a future opencode version renames it.
 def opencode_auth_key() -> str:
   data = read_json(data_home() / "opencode" / "auth.json")
   if not data:
     return ""
-  entry = data.get("opencode-go")
-  if isinstance(entry, dict):
-    return str(entry.get("key") or "").strip()
+  for provider_id in ("opencode", "opencode-go"):
+    entry = data.get(provider_id)
+    if isinstance(entry, dict):
+      key = str(entry.get("key") or "").strip()
+      if key:
+        return key
   return ""
 
 
