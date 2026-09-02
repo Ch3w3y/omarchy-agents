@@ -196,9 +196,22 @@ Item {
   property bool credentialSaving: false
   property string credentialSavingId: ""
 
+  // The key goes in over stdin, not argv. /proc/<pid>/cmdline is world-readable
+  // on Linux, so an API key passed as an argument is readable by every other
+  // process on the machine for as long as this one lives.
+  property string pendingCredential: ""
+
   Process {
     id: credentialProcess
     running: false
+    stdinEnabled: true
+
+    onStarted: {
+      write(root.pendingCredential + "\n")
+      root.pendingCredential = ""
+      stdinEnabled = false
+    }
+
     onExited: function(exitCode) {
       var id = root.credentialSavingId
       root.credentialSaving = false
@@ -216,7 +229,9 @@ Item {
     if (root.credentialSaving) return
     root.credentialSaving = true
     root.credentialSavingId = String(providerId)
-    credentialProcess.command = ["omarchy-agent-credential-set", String(providerId), String(apiKey || "")]
+    root.pendingCredential = String(apiKey || "")
+    credentialProcess.command = ["omarchy-agent-credential-set", "--stdin", String(providerId)]
+    credentialProcess.stdinEnabled = true
     credentialProcess.running = true
   }
 
